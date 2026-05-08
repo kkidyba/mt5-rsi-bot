@@ -1,0 +1,683 @@
+#property copyright "Wojciech Kidyba"
+#include <Trade\Trade.mqh>
+#include <Arrays\ArrayDouble.mqh>
+
+input int RSI_Period = 14;                           
+input double RISK_Percent = 10;                         
+input int Max_Positions = 15;
+input int RSI_Extremum_Calculate = 365;                
+input int Extremum_Array_Length = 10;                 
+input double Loss_Percent = 5;                          
+input double BE_Activation = 5;
+input double TS_Activation = 5;                       
+input double TS_Reducing = 5;                     
+input int SL_Activation = 2;                            
+input int RSI_Min_Value = 30;
+input int SL_Positions = 2;                          
+
+double RSI_min_avg = 0;                            
+double RSI_max_avg= 0;                            
+double sum_min = 0;                             
+double sum_max = 0;
+double last_loss_to_open;                          
+double loss_to_open;                              
+double sl_for_all;
+double trailing_difference;                      
+double trailing_extr; 
+datetime TS_Denigration_last_date;          
+double niewykonany_sl;                             
+bool sl_done = true;
+datetime time_last_check = 0;                              
+datetime time_current;                       
+datetime time_extr_last_check = 0;                 
+CArrayDouble min_array;                           
+CArrayDouble max_array;                           
+ulong first_position_ticket;                        
+double first_position_open;
+int last_error;
+int t = 0;
+int leverage;
+double volume_first;
+double sl_first;
+int RSiHandle;                                     
+double RSI_current;                               
+bool BreakEvenDone = false;
+bool EnoughMargin = true;
+bool TrailingActivated = false; 
+int no_open_positions = 0;
+int decimalPlaces = 0;
+CTrade trade;                                    
+int ExtTimeOut=0;
+
+//+------------------------------------------------------------------+
+//| Initialization function                                          |
+//+------------------------------------------------------------------+
+int OnInit() 
+   {                                                         
+   RSiHandle = iRSI(_Symbol,PERIOD_CURRENT,RSI_Period,PRICE_CLOSE);
+   trade.LogLevel(LOG_LEVEL_NO);
+   leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   while(point < 1.0)
+      {
+      point *= 10.0;
+      decimalPlaces++;
+      }   
+   return INIT_SUCCEEDED;
+   }
+
+//+------------------------------------------------------------------+
+//| OnTick function                                                  |
+//+------------------------------------------------------------------+
+void OnTick() 
+   {
+   time_current = TimeCurrent();
+   if(time_extr_last_check == 0 )                                  
+         {
+         int liczba_swiec = Bars(_Symbol,PERIOD_CURRENT);
+         if(liczba_swiec<RSI_Extremum_Calculate)
+           {
+            CalculateMax(liczba_swiec-RSI_Period,1);
+            CalculateMin(liczba_swiec-RSI_Period,1);       
+            time_extr_last_check = time_current;                           
+           }
+           else
+             {
+             for(int i=0;i<Extremum_Array_Length && liczba_swiec-RSI_Period> (i *RSI_Extremum_Calculate + RSI_Extremum_Calculate);i++)
+               {
+               CalculateMax(RSI_Extremum_Calculate,i*RSI_Extremum_Calculate +1);
+               CalculateMin(RSI_Extremum_Calculate,i*RSI_Extremum_Calculate+1);       
+               }
+               time_extr_last_check = time_current;
+             }
+         return;
+         }
+      if(iBarShift(_Symbol,PERIOD_CURRENT,time_extr_last_check)> (RSI_Extremum_Calculate))
+         {
+         time_extr_last_check = time_current;
+         CalculateMax(RSI_Extremum_Calculate, 1);                     
+         CalculateMin(RSI_Extremum_Calculate, 1);
+         }
+      
+      int positions = PositionsTotal();
+      if(positions>0)                                                  
+         {
+         if(!sl_done)                                
+            {
+            Print("Retrying SL");
+            SetStopLossForAll(niewykonany_sl);                         
+            }
+         if(no_open_positions<Max_Positions)    
+            {
+            Averaging(first_position_ticket);
+            }  
+         if(!BreakEvenDone)                                            
+            {  
+            if(no_open_positions>1 && (no_open_positions>t))
+               {
+               SafeAveraging();
+               }   
+            BreakEaven();
+            }
+         else if(time_current- time_last_check>60)                                      
+            {
+            TrailingStop();
+            time_last_check = time_current;
+            }
+         }
+         else                                                    
+            {
+            double rsi[];
+            CopyBuffer(RSiHandle,0,0,1,rsi);                     
+            RSI_current=rsi[0];                                              
+            OpenFirstTrade();
+            }
+   }
+
+//+------------------------------------------------------------------+
+//| Function opening the first trade                                 |
+//+------------------------------------------------------------------+
+void OpenFirstTrade()
+   {
+   if (RSI_current < RSI_min_avg && RSI_min_avg!=0)           
+      {
+      ResetVariables();
+      CalculateSL(true);
+      volume_first =CalculateVolume(sl_first, Max_Positions, RISK_Percent, ORDER_TYPE_BUY);
+      double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK)- SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double SL_spread = MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_ASK)- sl_first);
+      if(SL_spread>spread && spread<100*SymbolInfoDouble(_Symbol,SYMBOL_POINT))
+        {
+         OpenTrade(ORDER_TYPE_BUY);
+         first_position_ticket = PositionGetTicket(0);              
+         first_position_open = PositionGetDouble(POSITION_PRICE_OPEN);
+         last_loss_to_open = first_position_open * (Loss_Percent/(leverage*100)); 
+         loss_to_open = last_loss_to_open;                          
+         SetStopLossForAll(sl_first);
+        }
+      } 
+   if (RSI_current > RSI_max_avg && RSI_max_avg!=0)          
+      {
+      ResetVariables();
+      CalculateSL(false);
+      volume_first =CalculateVolume(sl_first, Max_Positions, RISK_Percent, ORDER_TYPE_SELL);
+      double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK)- SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double SL_spread = MathAbs(SymbolInfoDouble(_Symbol, SYMBOL_BID)- sl_first);
+      if(SL_spread>spread && spread<100*SymbolInfoDouble(_Symbol,SYMBOL_POINT))
+        {
+         OpenTrade(ORDER_TYPE_SELL);
+         first_position_ticket = PositionGetTicket(0);              
+         first_position_open = PositionGetDouble(POSITION_PRICE_OPEN);
+         last_loss_to_open = first_position_open * (Loss_Percent/(leverage*100)); 
+         loss_to_open = last_loss_to_open;                          
+         SetStopLossForAll(sl_first);
+        }
+      }
+   }
+
+//+------------------------------------------------------------------+
+//| Function opening trades                                          |
+//+------------------------------------------------------------------+
+bool OpenTrade(int order_type) 
+   {
+   bool result = false;
+   if (order_type == ORDER_TYPE_BUY)                                
+      {
+      result = trade.Buy(volume_first,_Symbol);
+      SetStopLossForAll(sl_first);
+      } 
+   else if (order_type == ORDER_TYPE_SELL)                          
+      {
+      result = trade.Sell(volume_first,_Symbol);
+      SetStopLossForAll(sl_first);
+      }
+   if (!result)                                                     
+      {
+      Print("Error opening position: ", GetLastError());
+      volume_first = volume_first - SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      OpenTrade(order_type);
+      } 
+   else                                                           
+      {
+      no_open_positions++;
+      }
+      return(result);
+   }
+
+//+------------------------------------------------------------------+
+//| Function calculating extremes                                    |
+//+------------------------------------------------------------------+
+void CalculateMax(int range, int start) 
+   {
+   double rsi_array[];                                         
+   CopyBuffer(RSiHandle, 0, start, range, rsi_array);
+   double max = rsi_array[ArrayMaximum(rsi_array)];      
+   
+   if(max == 0)                                                   
+      {
+      Print("Max = 0");
+      return;                                                 
+      }
+   if (max > (100-RSI_Min_Value))                                                 
+      {
+      bool max_found = false;
+      for (int i = 0; i < max_array.Total(); i++)                  
+         {
+         if (max_array.At(i) == max)                            
+            {
+            max_found = true;                                    
+            break;                                                
+            }
+         }
+      if (!max_found)                                              
+         {
+         max_array.Add(max);
+         sum_max += max;                                          
+         Print("Max: ", max);
+         if (max_array.Total() > Extremum_Array_Length)            
+            {
+            sum_max -= max_array.At(0);
+            max_array.Delete(0);                                   
+            }
+         RSI_max_avg = sum_max / max_array.Total();                
+         Print("Max AVG :", RSI_max_avg);
+         }
+      }
+      else
+      {
+      Print("Max: ", max, " < ", (100-RSI_Min_Value));
+      }
+   }
+
+void CalculateMin(int range, int start) 
+   {
+   double rsi_array[];
+   CopyBuffer(RSiHandle, 0, start, range, rsi_array);                  
+   
+   double min = rsi_array[ArrayMinimum(rsi_array)];                
+   
+   if(min == 0)                                                
+      {
+      Print("Min = 0");
+      return;                                                    
+      }
+   if (min < RSI_Min_Value && min > 0)                                       
+      {
+      bool min_found = false;
+      for (int i = 0; i < min_array.Total(); i++)                 
+         {
+         if (min_array.At(i) == min)                             
+            {
+            min_found = true;                                      
+            break;                                                
+            }
+         }
+      if (!min_found)                                             
+         {
+         min_array.Add(min);
+         sum_min += min;                                         
+         Print("Min: ", min);
+         if (min_array.Total() > Extremum_Array_Length)           
+            {
+            sum_min -= min_array.At(0);
+            min_array.Delete(0);                                   
+            }
+         RSI_min_avg = sum_min / min_array.Total();
+         Print("Min AVG :", RSI_min_avg);
+         }
+      }
+      else
+      {
+      Print("Min: ",min, " > ", (RSI_Min_Value));
+      }
+   }
+
+//+------------------------------------------------------------------+
+//| Function averaging price down                                    |
+//+------------------------------------------------------------------+
+void Averaging(ulong ticket)
+   {  
+   if(PositionSelectByTicket(ticket))                             
+      {                             
+      int position_type = PositionGetInteger(POSITION_TYPE);
+      bool result;
+      if(position_type == POSITION_TYPE_BUY)                          
+         {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(ask <= (first_position_open - loss_to_open))                     
+            { 
+            if(!OpenTrade(ORDER_TYPE_BUY))                             
+               {
+               EnoughMargin = false;   
+               Print("PROBABLY INSUFFICIENT MARGIN/CAPITAL");
+               }                        
+            last_loss_to_open = last_loss_to_open * 0.9;
+            loss_to_open =loss_to_open + last_loss_to_open;          
+            return;
+            }
+         }
+      if(position_type == POSITION_TYPE_SELL)                         
+         {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(bid >= (first_position_open + loss_to_open))                       
+            {
+            if(!OpenTrade(ORDER_TYPE_SELL))                          
+               {
+               EnoughMargin = false;  
+               Print("PROBABLY INSUFFICIENT MARGIN/CAPITAL");
+               }                                                        
+            last_loss_to_open = last_loss_to_open * 0.9;
+            loss_to_open = loss_to_open + last_loss_to_open;          
+            return;
+            }       
+         }
+      }
+   }  
+
+//+------------------------------------------------------------------+
+//| Stop Loss for each position                                      |
+//+------------------------------------------------------------------+
+bool SetStopLossForAll(double stop_loss_price) 
+   {
+   stop_loss_price = NormalizeDouble(stop_loss_price, decimalPlaces);          
+   int total_positions = PositionsTotal();
+   for (int i = 0; i < total_positions; i++)                       
+      {
+      int ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket))                          
+         {
+         double position_sl = PositionGetDouble(POSITION_SL);
+         if (position_sl != stop_loss_price)                       
+            {
+            if (trade.PositionModify(ticket, stop_loss_price, NULL)) 
+               {      
+               } 
+            else                                                  
+               {
+               Print("Failed to set Stop Loss for ticket ", ticket, ", error: ", GetLastError(), " Stop loss price: ", stop_loss_price); 
+               niewykonany_sl = stop_loss_price;                   
+               sl_done = false; 
+               return(false);
+               }
+            } 
+         } 
+      else                                                       
+         {
+         Print("Failed to select position by ticket: ", ticket, ", error: ", GetLastError());
+         }
+      }
+   sl_done = true; 
+   return(true);                                                
+   }
+
+//+------------------------------------------------------------------+
+//| Calculating BreakEven                                            |
+//+------------------------------------------------------------------+
+double CalculateBreakeEven()
+   {
+   int total_positions = PositionsTotal(); 
+   double price_sum = 0;
+   for (int i = 0; i < total_positions; i++) 
+      {
+      int ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket)) 
+            { 
+            price_sum = price_sum + PositionGetDouble(POSITION_PRICE_OPEN);
+            } 
+         else 
+            {
+            Print("Failed to select position by ticket : ", ticket, ", error: ", GetLastError());
+            }
+      }
+   double avg_price = price_sum/total_positions;      
+   return(avg_price);
+   } 
+
+//+------------------------------------------------------------------+
+//| BreakEven Activation                                             |
+//+------------------------------------------------------------------+
+void BreakEaven()
+   {
+   if(BE_Activation == 0)                                  
+     {
+      BreakEvenDone = true;
+      return;                                                      
+     }
+   PositionSelectByTicket(first_position_ticket);               
+   int type = PositionGetInteger(POSITION_TYPE);                 
+   
+   double br_price = CalculateBreakeEven();
+   if(type == POSITION_TYPE_BUY)                              
+      {
+      double sl_activation = br_price * (1 + (BE_Activation/(leverage*100)));
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);      
+      if(bid > sl_activation)                                
+         {
+         if(SetStopLossForAll(br_price))                        
+            {
+            BreakEvenDone = true;                               
+            return;
+            }
+         }
+      }
+   else if(type == POSITION_TYPE_SELL)                        
+      {
+      double sl_activation = br_price * (1 - (BE_Activation/(leverage*100)));
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);       
+         
+      if(ask < sl_activation)                                  
+         {
+         if(SetStopLossForAll(br_price))                        
+            {
+            BreakEvenDone = true;                               
+            return;
+            }            
+         }
+      }        
+   }
+   
+//+------------------------------------------------------------------+
+//| TrailingStop Activation                                          |
+//+------------------------------------------------------------------+
+void TrailingStop()
+   {
+   PositionSelectByTicket(first_position_ticket);                 
+   int type = PositionGetInteger(POSITION_TYPE);                   
+   double sl_price = PositionGetDouble(POSITION_SL);               
+   double br_price = CalculateBreakeEven();
+   if(type == POSITION_TYPE_BUY)                                   
+      {
+   int bar = iBarShift(_Symbol, PERIOD_CURRENT, TS_Denigration_last_date);
+   if(trailing_difference == 0)                                   
+      {
+      trailing_difference = br_price * ((TS_Activation+BE_Activation)/(leverage*100));
+      TS_Denigration_last_date = time_current;             
+      }
+   else if (bar > 0 && TrailingActivated)                                               
+      {
+      trailing_difference = trailing_difference * (1 - TS_Reducing/100);
+      TS_Denigration_last_date = time_current;               
+      }
+   
+   if(sl_price < br_price)                                           
+     {
+      sl_price = br_price;
+     }
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(trailing_extr == NULL || trailing_extr<bid)
+        {
+         trailing_extr = bid;
+        }
+      double tr_activation = sl_price + trailing_difference;
+      if(trailing_extr > tr_activation)                                   
+         {
+         SetStopLossForAll(trailing_extr - trailing_difference);
+         TrailingActivated = true;
+         return;
+         }
+      }
+   else if(type == POSITION_TYPE_SELL)                           
+      {
+   int bar = iBarShift(_Symbol, PERIOD_CURRENT, TS_Denigration_last_date);
+   if(trailing_difference == 0)                                    
+      {
+      trailing_difference = br_price * ((TS_Activation+BE_Activation)/(leverage*100));
+      TS_Denigration_last_date = time_current;              
+      }
+   else if (bar > 0 && TrailingActivated)                                             
+      {
+      trailing_difference = trailing_difference * (1 - TS_Reducing/100);
+      TS_Denigration_last_date = time_current;              
+      }
+   
+   if(sl_price > br_price)                                               
+     {
+      sl_price = br_price;
+     }
+      double tr_activation = (sl_price - trailing_difference);     
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(trailing_extr == NULL || trailing_extr>ask)
+        {
+         trailing_extr = ask;
+        }
+      if(trailing_extr < tr_activation)                                    
+         {
+         SetStopLossForAll(trailing_extr + trailing_difference);
+         TrailingActivated = true;
+         return;
+         }
+      }      
+   }
+
+//+------------------------------------------------------------------+
+//| Resetting global variables after closing positions               |
+//+------------------------------------------------------------------+
+void ResetVariables()
+   {
+   last_loss_to_open = NULL;                                   
+   loss_to_open = NULL;                                     
+   first_position_ticket = NULL;                               
+   BreakEvenDone = false;
+   niewykonany_sl = NULL;                                   
+   trailing_difference = 0;                                     
+   EnoughMargin = true;                                           
+   last_error = NULL;
+   t = 0;
+   trailing_extr = NULL;
+   no_open_positions = 0;
+   TrailingActivated = false; 
+   }
+
+void SafeAveraging()
+   {
+   if(SL_Activation == 0)
+     {
+      return;
+     }
+   double sl_price;
+   double open_price; 
+   ulong sl_ticket = first_position_ticket+no_open_positions-1-t;
+   ulong open_ticket = sl_ticket - SL_Activation;
+   int type;
+   if(HistoryOrderSelect(sl_ticket))
+      {
+      sl_price = HistoryOrderGetDouble(sl_ticket,ORDER_PRICE_CURRENT);
+      type = HistoryOrderGetInteger(sl_ticket,ORDER_TYPE);
+      }
+   if(HistoryOrderSelect(open_ticket))
+      {
+      open_price = HistoryOrderGetDouble(open_ticket, ORDER_PRICE_CURRENT);
+      }
+   if(type == POSITION_TYPE_BUY && no_open_positions>SL_Activation && sl_price<CalculateBreakeEven())
+     {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid>open_price)
+        {
+         SetStopLossForAll(sl_price);
+         t++;
+         return;
+        }
+     }
+   else if(type == POSITION_TYPE_SELL && no_open_positions>SL_Activation && sl_price>CalculateBreakeEven())
+      {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(ask<open_price)
+         {
+         SetStopLossForAll(sl_price);
+         t++;
+         return;
+         }
+      }
+   }
+
+void CalculateSL(bool isBuy){
+double lossPercent = Loss_Percent/(leverage*100);
+   if(isBuy)
+     {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl_percent = 1;
+      for(int i=0;i<Max_Positions+SL_Positions-1;i++)
+        {
+         sl_percent = sl_percent - lossPercent;
+        }
+        sl_first = ask * sl_percent;
+      if(sl_first == ask)
+          {
+           sl_first = NULL;
+          }
+     }else
+        {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double sl_percent = 1; 
+         for(int i=0;i<Max_Positions+SL_Positions-1;i++)
+            {
+            sl_percent = sl_percent + lossPercent;
+            }
+         sl_first = bid * sl_percent;
+         if(sl_first == bid)
+          {
+           sl_first = NULL;
+          }       
+         }
+}
+
+double CalculateVolume(double sl_price, int sequence_orders, double risk_percent, ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY)
+{
+   if(sl_price== NULL)
+     {
+      return(0.01);
+     }
+    // Equity and risk
+    double balance        = AccountInfoDouble(ACCOUNT_BALANCE);
+    double total_risk     = balance * risk_percent / 100.0;
+    double risk_per_trade = total_risk/ sequence_orders;
+    
+    // Instrument parameters
+    double lot_min, lot_max, lot_step;
+    SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN,  lot_min);
+    SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX,  lot_max);
+    SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP, lot_step);
+    
+    int precision = (int)MathLog10(1.0 / lot_step);
+    
+    // Entry prices and SL
+    double entry_price = (order_type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double simulated_loss = 0.0;
+    if (!OrderCalcProfit(order_type, _Symbol, lot_max, entry_price, sl_price, simulated_loss) || simulated_loss >= 0)
+        return 0.0;
+        
+    // Calculate final lot size
+    double final_lots = fmin(fmax(round(risk_per_trade*lot_max/(-simulated_loss*lot_step))*lot_step, lot_min), lot_max);
+    double margin;
+    double start_price = entry_price;
+    double last_price = start_price; 
+    double difference = start_price * ((Loss_Percent/(100*leverage)));
+    double loss;
+   OrderCalcMargin(order_type, _Symbol, final_lots * sequence_orders, entry_price, margin);
+   
+   while(margin>balance && final_lots>lot_min)
+      {
+       final_lots = final_lots - lot_step;
+       OrderCalcMargin(order_type, _Symbol, final_lots * sequence_orders, entry_price, margin);
+      }
+    if(order_type == ORDER_TYPE_BUY)
+      {
+      for(int i=1;i<sequence_orders;i++)
+        {
+         last_price = last_price - difference;
+         difference = difference * 0.9;
+        }
+        difference = start_price * ((Loss_Percent/(100*leverage)));
+      for(int i=1;i<sequence_orders;i++)
+       {
+        OrderCalcProfit(order_type,_Symbol, final_lots, start_price, last_price, loss);
+        balance = balance + loss; 
+        start_price = start_price - difference; 
+        difference = difference * 0.9;
+       } 
+      }
+      else
+      {
+      for(int i=1;i<sequence_orders;i++)
+        {
+         last_price = last_price + difference;
+         difference = difference * 0.9; 
+        }
+     difference = start_price * ((Loss_Percent/(100*leverage)));
+     for(int i=1;i<sequence_orders;i++)
+       {
+        OrderCalcProfit(order_type,_Symbol, final_lots, start_price, last_price, loss);
+        balance = balance + loss; 
+        start_price = start_price + difference; 
+        difference = difference * 0.9;
+       } 
+      }
+    OrderCalcMargin(order_type, _Symbol, final_lots * sequence_orders, entry_price, margin);
+    while(margin>balance && final_lots>lot_min)
+      {
+       final_lots = final_lots - lot_step;
+       OrderCalcMargin(order_type, _Symbol, final_lots * sequence_orders, entry_price, margin);
+      }
+      final_lots =NormalizeDouble(final_lots, precision); 
+    return final_lots;
+}
